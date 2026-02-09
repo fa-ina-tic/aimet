@@ -1,0 +1,1 @@
+from .smoothquant_optimizer import apply_smoothquant
