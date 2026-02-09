@@ -13,14 +13,17 @@ import math
 import torch
 from aimet_torch.v2.quantization.encoding_analyzer import (
     EncodingAnalyzer,
+    MinMaxEncodingAnalyzer,
     _flag_extreme_min_max,
 )
 from aimet_torch.v2.quantization.base import QuantizerBase
 from aimet_torch.v2.quantization.float import FloatEncoding
 from aimet_torch.v2.quantization.tensor import DequantizedTensor
-from aimet_torch.v2.utils import StatisticsNotFoundError, patch_attr
+from aimet_torch.v2.utils import StatisticsNotFoundError, patch_attr, _is_expandable
 from aimet_torch.fp_quantization import fake_cast_to_ieee_float
-from ._finfo import _finfo, _torch_dtype_to_finfo
+from ._finfo import _finfo, _torch_dtype_to_finfo, _float4_e2m1fn
+from aimet_torch.v2.quantization._utils import interleave, concretize_block_size
+import aimet_torch.v2.experimental.onnx._export as _onnx
 
 
 __all__ = ["QuantizeDequantize", "FloatQuantizeDequantize"]
@@ -60,38 +63,32 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
         exponent\_max = 2^{exponent} - 1 \\
 
     Args:
-        exponent_bits (int): Number of exponent bits to simulate
-        mantissa_bits (int):  Number of mantissa bits to simulate
-        dtype (torch.dtype): torch.dtype to simulate. This argument is mutually exclusive with exponent_bits and mantissa_bits.
-        encoding_analyzer (EncodingAnalyzer): If specified, the maximum value to represent will be determined dynamically based on the input statistics for finer precision.
+        exponent_bits (int): Number of exponent bits to simulate. This argument is mutually exclusive with `dtype`.
+        mantissa_bits (int):  Number of mantissa bits to simulate. This argument is mutually exclusive with `dtype`.
+        finite (bool, optional): If True, +/-inf is representable. Defaults to `False`. Ignored when `dtype` is specified.
+        unsigned_zero (bool, optional): If False, +/-0 is representable. Defaults to `True`. Ignored when `dtype` is specified.
+        dtype (torch.dtype): torch.dtype to simulate. This argument is mutually exclusive with `exponent_bits` and `mantissa_bits`.
+        shape (tuple, optional): Shape of quantization scales. Defaults to `()` (= per-tensor quantization).
+        block_size (tuple, optional): If specified, block-wise quantization is performed with the given block size.
+        encoding_analyzer (EncodingAnalyzer, optional):
+            If specified, quantization scale will be calibrated dynamically based on the input statistics.
+            If not specified,
+            sub-16-bit floating point quantizers will use min-max encoding analyzer for scale calibration;
+            16-bit or higher quantizers will be fixed at scale=1.0
 
     Examples:
 
-        >>> import aimet_torch.v2.quantization as Q
-        >>> input = torch.tensor([[ 1.8998, -0.0947],[-1.0891, -0.1727]])
-        >>> qdq = Q.float.FloatQuantizeDequantize(mantissa_bits=7, exponent_bits=8)
-        >>> # Unlike AffineQuantizer, FloatQuantizer is initialized without calling compute_encodings()
-        >>> qdq.is_initialized()
-        True
-        >>> qdq.is_bfloat16()
-        True
-        >>> qdq.bitwidth
-        16
+        >>> import aimet_torch.quantization as Q
+        >>> input = torch.tensor([[ 1.8998, -0.0947, -1.0891, -0.1727]])
+        >>> qdq = Q.float.FloatQuantizeDequantize(dtype=torch.float8_e4m3fnuz)
+        >>> with qdq.compute_encodings():
+        ...     _ = qdq(input)
+        ...
         >>> qdq(input)
-        tensor([[ 1.8984, -0.0947], [-1.0859, -0.1729]])
-
-        >>> from aimet_torch.v2.quantization.encoding_analyzer import MinMaxEncodingAnalyzer
-        >>> encoding_analyzer = MinMaxEncodingAnalyzer(shape=[])
-        >>> qdq = Q.float.FloatQuantizeDequantize(dtype=torch.float16, encoding_analyzer=encoding_analyzer)
-        >>> qdq.is_float16()
-        True
-        >>> qdq.bitwidth
-        16
-        >>> qdq(input)
-        tensor([[ 1.8994, -0.0947], [-1.0889, -0.1727]])
+        DequantizedTensor([[ 1.8998, -0.0950, -1.1399, -0.1741]])
     """
 
-    maxval: Optional[torch.Tensor]
+    maxval: torch.Tensor
 
     def __init__(
         self,
@@ -100,6 +97,8 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
         finite: Optional[bool] = None,
         unsigned_zero: Optional[bool] = None,
         dtype: Optional[torch.dtype] = None,
+        shape: Optional[tuple[int, ...]] = None,
+        block_size: Optional[tuple[int, ...]] = None,
         encoding_analyzer: Optional[EncodingAnalyzer] = None,
     ):
         super().__init__()
@@ -133,21 +132,36 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
 
         self._finfo = _finfo(exponent_bits, mantissa_bits, finite, unsigned_zero)
 
+        if shape is None:
+            self.shape = encoding_analyzer.observer.shape if encoding_analyzer else ()
+        else:
+            self.shape = shape
+
+        self.block_size = block_size
+
+        if self.bitwidth < 16 and encoding_analyzer is None:
+            encoding_analyzer = MinMaxEncodingAnalyzer(self.shape, self.block_size)
+
         self.encoding_analyzer = encoding_analyzer
 
-        if self.encoding_analyzer:
-            shape = self.encoding_analyzer.observer.shape
-            maxval = self._finfo.max
-            self.register_buffer("maxval", torch.full(shape, maxval))
-        else:
-            self.register_buffer("maxval", None)
+        if encoding_analyzer:
+            if not _is_expandable(self.encoding_analyzer.observer.shape, self.shape):
+                raise RuntimeError(
+                    f"Encoding analyzer of shape {self.encoding_analyzer.observer.shape} "
+                    f"is incompatible with quantizer of shape {self.shape}."
+                )
+
+        maxval = self._finfo.max
+        self.register_buffer("maxval", torch.full(self.shape, maxval))
 
         self._is_overwrite_allowed.update({"maxval": True})
 
         self._assert_supported_dtype()
 
     def _assert_supported_dtype(self):
-        if self._finfo.finite or self._finfo.unsigned_zero:
+        if self._finfo != _float4_e2m1fn and (
+            self._finfo.finite or self._finfo.unsigned_zero
+        ):
             if self._finfo.to_torch_dtype() is None:
                 torch_special_builtin_dtypes = [
                     dtype
@@ -184,19 +198,45 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
         self._finfo = _finfo(exponent_bits, mantissa_bits, finite, unsigned_zero)
 
     def get_extra_state(self):
+        if torch.onnx.is_in_onnx_export():
+            # Bypass get_extra_state during ONNX export.
+            # ONNX export doesn't support non-tensor objects in state_dict
+            # Return empty tensor since extra state is unnecessary for ONNX export anyway
+            return torch.tensor([])
+
         extra_state_dict = super().get_extra_state()
-        extra_state_dict["exponent_bits"] = torch.tensor(self.exponent_bits)
-        extra_state_dict["mantissa_bits"] = torch.tensor(self.mantissa_bits)
+        finfo = self._finfo
+        extra_state_dict.update(
+            {
+                "exponent_bits": torch.tensor(finfo.exponent_bits),
+                "mantissa_bits": torch.tensor(finfo.mantissa_bits),
+                "finite": torch.tensor(finfo.finite),
+                "unsigned_zero": torch.tensor(finfo.unsigned_zero),
+                "block_size": torch.tensor(self.block_size or ()),
+            }
+        )
         return extra_state_dict
 
     def set_extra_state(self, state):
-        self.exponent_bits = state["exponent_bits"].item()
-        self.mantissa_bits = state["mantissa_bits"].item()
+        block_size = tuple(state.get("block_size", self.block_size or ()))
+        self.block_size = block_size or None
+
+        exponent_bits = state.get("exponent_bits", self._finfo.exponent_bits)
+        mantissa_bits = state.get("mantissa_bits", self._finfo.mantissa_bits)
+        finite = state.get("finite", self._finfo.finite)
+        unsigned_zero = state.get("unsigned_zero", self._finfo.unsigned_zero)
+
+        self._finfo = _finfo(
+            exponent_bits=int(exponent_bits),
+            mantissa_bits=int(mantissa_bits),
+            finite=bool(finite),
+            unsigned_zero=bool(unsigned_zero),
+        )
         super().set_extra_state(state)
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         if "maxval" in state_dict:
-            if self.maxval is None:
+            if self.maxval is None or self.maxval.shape != state_dict["maxval"].shape:
                 del self.maxval
                 self.register_buffer("maxval", state_dict["maxval"])
         elif self.maxval is not None:
@@ -204,6 +244,10 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
             self.register_buffer("maxval", None)
 
         ret = super().load_state_dict(state_dict, *args, **kwargs)
+
+        if self.maxval is not None:
+            self.shape = tuple(self.maxval.shape)
+
         return ret
 
     @property
@@ -255,11 +299,12 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
                 self._finfo.exponent_bits,
                 self._finfo.finite,
                 self._finfo.unsigned_zero,
-                self.maxval,
+                self.get_scale(),
+                block_size=self.block_size,
             )
         return None
 
-    def get_scale(self) -> Optional[torch.Tensor]:
+    def get_scale(self) -> torch.Tensor:
         log2_scale = self._get_log2_scale()
 
         if log2_scale is None:
@@ -267,23 +312,25 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
 
         return 2**log2_scale
 
-    def _get_log2_scale(self) -> Optional[torch.Tensor]:
-        if self.maxval is None:
-            return None
-
+    def _get_log2_scale(self) -> torch.Tensor:
         return torch.log2(self.maxval.abs()) - math.log2(self._finfo.max)
 
     @classmethod
     def from_encodings(cls, encodings: FloatEncoding) -> "FloatQuantizeDequantize":
+        # pylint: disable=protected-access
         if not isinstance(encodings, FloatEncoding):
             raise TypeError(f"Expected {FloatEncoding}; got {type(encodings)}")
 
         qtzr = cls(
-            exponent_bits=encodings.exponent_bits, mantissa_bits=encodings.mantissa_bits
+            *encodings._finfo,
+            shape=encodings.scale.shape,
+            block_size=encodings.block_size,
         )
 
-        if encodings.maxval is not None:
-            qtzr.maxval.copy_(encodings.maxval)
+        if encodings.scale.numel() == 1 and encodings.scale.item() == 1:
+            pass
+        else:
+            qtzr.maxval = encodings.maxval.clone().detach()
 
         return qtzr
 
@@ -301,7 +348,7 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
         original_forward = self.forward
 
         @functools.wraps(original_forward)
-        def forward_wrapper(input):
+        def forward_wrapper(input: torch.Tensor) -> torch.Tensor:
             input = input.as_subclass(torch.Tensor)
             batch_statistics = self.encoding_analyzer.update_stats(input)
             num_steps = math.pow(2, self.bitwidth) - 1
@@ -366,7 +413,10 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
         # is known to introduce substantial CPU overhead.
         # Cast types of the inputs to plain torch.Tensor for faster execution.
         output = _fake_cast(
-            input.as_subclass(torch.Tensor), self._finfo, self.get_scale()
+            input.as_subclass(torch.Tensor),
+            self._finfo,
+            encoding.scale,
+            self.block_size,
         )
         output = output.as_subclass(DequantizedTensor)
         output.encoding = encoding
@@ -400,10 +450,12 @@ class QuantizeDequantize(FloatQuantizeDequantize):
     """
 
 
+@_onnx.register_symbolic(_onnx.float_quantize_dequantize_symbolic)
 def _fake_cast(
     input: torch.Tensor,
     finfo: _finfo,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor,
+    block_size: Optional[tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """
     Fake-cast input to target float dtype.
@@ -413,28 +465,33 @@ def _fake_cast(
       finfo: Target float dtype
       scale: Scaling factor
     """
+    output_shape = input.shape
+
+    if block_size is not None:
+        if scale is None:
+            raise ValueError("Block-wise float QDQ requires scale.")
+
+        block_size = concretize_block_size(input.shape, scale.shape, block_size)
+        input = input.reshape(-1, *interleave(scale.shape, block_size))
+        scale = scale.view(interleave(scale.shape, 1))
+
     if finfo.to_torch_dtype():
         # Well knwon data types. Use cast-decast for better performance
         fake_cast = _cast_decast
-    elif not finfo.finite and not finfo.unsigned_zero:
-        # IEEE fake-cast is only valid when finite = unsigned_zero = false
+    elif not finfo.unsigned_zero:
+        # IEEE fake-cast is only valid when unsigned_zero = false
         fake_cast = _fake_cast_to_ieee_float
     else:
         raise NotImplementedError(
             f"Fake-casting to {finfo.to_str()} is not implemented"
         )
 
-    # Analogous to quantize
-    if scale is not None:
-        input = input / scale
+    input = input / scale
     input = input.clamp(-finfo.max, finfo.max)
     input = fake_cast(input, finfo)
+    input = input * scale
 
-    # Analogous to dequantize
-    if scale is not None:
-        input = input * scale
-
-    return input
+    return input.reshape(output_shape)
 
 
 def _cast_decast(input: torch.Tensor, finfo: _finfo):
@@ -443,5 +500,5 @@ def _cast_decast(input: torch.Tensor, finfo: _finfo):
 
 def _fake_cast_to_ieee_float(input: torch.Tensor, finfo: _finfo):
     return fake_cast_to_ieee_float(
-        input, finfo.max, finfo.exponent_bits, finfo.mantissa_bits
+        input, finfo.max, finfo.exponent_bits, finfo.mantissa_bits, finite=finfo.finite
     )

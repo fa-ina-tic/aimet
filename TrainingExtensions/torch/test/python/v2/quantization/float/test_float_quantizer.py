@@ -4,16 +4,20 @@
 
 import pytest
 
+from pathlib import Path
 import random
-import tempfile
+import itertools
 import torch
 import numpy as np
+import onnx
+import onnxruntime as ort
 import warnings
+import aimet_torch
 from aimet_torch.v2.quantization.encoding_analyzer import MinMaxEncodingAnalyzer
 from aimet_torch.v2.quantization import DequantizedTensor
 from aimet_torch.v2.quantization.float import FloatQuantizeDequantize, FloatEncoding
-from aimet_torch.v2.quantization.float._finfo import _finfo
-from aimet_torch.fp_quantization import fake_cast_to_ieee_float
+from aimet_torch.v2.quantization.float.quantizer import _fake_cast_to_ieee_float
+from aimet_torch.v2.quantization.float._finfo import _finfo, _float8_e4m3fn
 
 
 @pytest.fixture(autouse=True)
@@ -38,15 +42,14 @@ def x():
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    "dtype,               exponent_bits, mantissa_bits, finite, unsigned_zero",
+    "dtype, exponent_bits, mantissa_bits, finite, unsigned_zero",
     [
         (torch.float16, 5, 10, False, False),
         (torch.bfloat16, 8, 7, False, False),
         (torch.float8_e5m2, 5, 2, False, False),
         (torch.float8_e4m3fn, 4, 3, True, False),
-        # NOTE: Not supported in torch 2.1
-        # (torch.float8_e5m2fnuz, 5,             2,             False,  False),
-        # (torch.float8_e4m3fnuz, 4,             3,             True,   False),
+        (torch.float8_e5m2fnuz, 5, 2, True, True),
+        (torch.float8_e4m3fnuz, 4, 3, True, True),
     ],
 )
 def test_qdq_output_standard_dtypes(
@@ -74,23 +77,52 @@ def test_qdq_output_standard_dtypes(
     float_qdq_2 = FloatQuantizeDequantize(
         exponent_bits, mantissa_bits, finite, unsigned_zero
     )
+    assert float_qdq_1._finfo == float_qdq_2._finfo
+    assert (float_qdq_1.encoding_analyzer is None) == (float_qdq_1.bitwidth >= 16)
+    assert (float_qdq_2.encoding_analyzer is None) == (float_qdq_2.bitwidth >= 16)
+
     float_qdq_out_1 = float_qdq_1(x)
     float_qdq_out_2 = float_qdq_2(x)
     assert torch.equal(float_qdq_out_1, float_qdq_out_2)
     assert isinstance(float_qdq_out_1, DequantizedTensor)
     assert isinstance(float_qdq_out_2, DequantizedTensor)
     assert (
-        float_qdq_out_1.encoding.exponent_bits
-        == float_qdq_out_2.encoding.exponent_bits
-        == exponent_bits
-    )
-    assert (
-        float_qdq_out_1.encoding.mantissa_bits
-        == float_qdq_out_2.encoding.mantissa_bits
-        == mantissa_bits
+        float_qdq_out_1.encoding._finfo
+        == float_qdq_out_2.encoding._finfo
+        == float_qdq_1._finfo
     )
     assert float_qdq_out_1.dequantize() is float_qdq_out_1
     assert float_qdq_out_2.dequantize() is float_qdq_out_2
+
+    """
+    When: Run compute_encodings() and forward again
+    Then:
+      1. The two quantizers should still produce same output
+      2. If sub-16 floating point, compute_encodings should update its maxval
+    """
+    with float_qdq_1.compute_encodings(), float_qdq_2.compute_encodings():
+        _ = float_qdq_1(x)
+        _ = float_qdq_2(x)
+
+    float_qdq_out_1_post_calib = float_qdq_1(x)
+    float_qdq_out_2_post_calib = float_qdq_2(x)
+    assert torch.equal(float_qdq_out_1, float_qdq_out_2)
+    assert isinstance(float_qdq_out_1, DequantizedTensor)
+    assert isinstance(float_qdq_out_2, DequantizedTensor)
+    assert (
+        float_qdq_out_1_post_calib.encoding._finfo
+        == float_qdq_out_2_post_calib.encoding._finfo
+        == float_qdq_1._finfo
+    )
+    assert float_qdq_out_1_post_calib.dequantize() is float_qdq_out_1_post_calib
+    assert float_qdq_out_2_post_calib.dequantize() is float_qdq_out_2_post_calib
+
+    if float_qdq_1.bitwidth < 16:
+        assert not torch.isclose(float_qdq_out_1, float_qdq_out_1_post_calib).all()
+        assert not torch.isclose(float_qdq_out_2, float_qdq_out_2_post_calib).all()
+    else:
+        assert torch.equal(float_qdq_out_1, float_qdq_out_1_post_calib)
+        assert torch.equal(float_qdq_out_2, float_qdq_out_2_post_calib)
 
 
 @pytest.mark.parametrize(
@@ -122,20 +154,61 @@ def test_special_floats_sanity(finite, unsigned_zero):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("exponent_bits", [3, 4])
-@pytest.mark.parametrize("mantissa_bits", [3, 4])
-def test_qdq_output_non_standard_dtypes(x, exponent_bits, mantissa_bits):
+def test_qdq_output_non_standard_dtype():
     """
     Given: Instantiated FloatQuantizeDequantize with a non-standard float dtype
     When: Run forward
     Then: Output should be equal to fake-casting the input to the non-standard float
     """
-    float_qdq = FloatQuantizeDequantize(exponent_bits, mantissa_bits)
-    max_representable_value = _finfo(exponent_bits, mantissa_bits, False, False).max
-    expected_output = fake_cast_to_ieee_float(
-        x, max_representable_value, exponent_bits, mantissa_bits
+    #  float4_e2m1fn
+    # |  in  | out  |
+    # |------|------|
+    # | -6.5 | -6.0 |
+    # | -6.0 | -6.0 |
+    # | -5.5 | -6.0 |
+    # | -5.0 | -4.0 |
+    # | -4.5 | -4.0 |
+    # | -4.0 | -4.0 |
+    # | -3.5 | -4.0 |
+    # | -3.0 | -3.0 |
+    # | -2.5 | -2.0 |
+    # | -2.0 | -2.0 |
+    # | -1.5 | -1.5 |
+    # | -1.0 | -1.0 |
+    # | -0.5 | -0.5 |
+    # |  0.0 |  0.0 |
+    # |  0.5 |  0.5 |
+    # |  1.0 |  1.0 |
+    # |  1.5 |  1.5 |
+    # |  2.0 |  2.0 |
+    # |  2.5 |  2.0 |
+    # |  3.0 |  3.0 |
+    # |  3.5 |  4.0 |
+    # |  4.0 |  4.0 |
+    # |  4.5 |  4.0 |
+    # |  5.0 |  4.0 |
+    # |  5.5 |  6.0 |
+    # |  6.0 |  6.0 |
+    # |  6.5 |  6.0 |
+    x = torch.tensor(
+        [-6.5, -6, -5.5, -5, -4.5, -4, -3.5, -3, -2.5, -2, -1.5, -1, -0.5]
+        + [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5]
     )
-    assert torch.equal(float_qdq(x), expected_output)
+    expected_output = torch.tensor(
+        [-6, -6, -6, -4, -4, -4, -4, -3, -2, -2, -1.5, -1, -0.5]
+        + [0, 0.5, 1, 1.5, 2, 2, 3, 4, 4, 4, 4, 6, 6, 6]
+    )
+    float4_e2m1fn_qdq = FloatQuantizeDequantize(
+        exponent_bits=2,
+        mantissa_bits=1,
+        finite=True,
+        unsigned_zero=False,
+    )
+    assert torch.equal(float4_e2m1fn_qdq(x), expected_output)
+    assert torch.equal(
+        expected_output,
+        _fake_cast_to_ieee_float(x, float4_e2m1fn_qdq._finfo),
+    )
 
 
 @torch.no_grad()
@@ -144,12 +217,24 @@ def test_qdq_output_non_standard_dtypes(x, exponent_bits, mantissa_bits):
     [
         torch.float8_e5m2,
         torch.float8_e4m3fn,
-        # NOTE: Not supported in torch 2.1
-        # torch.float8_e5m2fnuz,
-        # torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+        torch.float8_e4m3fnuz,
     ],
 )
-def test_qdq_compute_encodings(dtype):
+@pytest.mark.parametrize(
+    "shape, block_size",
+    [
+        [(100,), None],
+        [(10, 1), None],
+        [(10, 2), (1, 50)],
+        [(2, 2), (5, 50)],
+    ],
+)
+def test_qdq_compute_encodings(
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    block_size: tuple[int, ...] | None,
+):
     """
     Given: Instantiated FloatQuantizeDequantize with a min-max encoding analyzer
     When: compute_encodings() and run forwad
@@ -164,28 +249,37 @@ def test_qdq_compute_encodings(dtype):
     ]:
         x = x.view(10, 100)
 
-        encoding_analyzer = MinMaxEncodingAnalyzer((100,))
         float8_qdq = FloatQuantizeDequantize(
-            dtype=dtype, encoding_analyzer=encoding_analyzer
+            dtype=dtype, shape=shape, block_size=block_size
         )
         with float8_qdq.compute_encodings():
             _ = float8_qdq(x)
 
-        scale = float8_qdq.get_scale()
-        expected_scale = x.abs().max(dim=0).values / float8_max
-        assert torch.allclose(scale, expected_scale)
+        output = float8_qdq(x)
+        scale = float8_qdq.get_scale().unsqueeze(0)
 
-        expected_output = (x / scale).clamp(-float8_max, float8_max).to(dtype).to(
-            x.dtype
-        ) * scale
-        assert torch.allclose(float8_qdq(x), expected_output, atol=float8_tiny)
+        if block_size:
+            B0, B1 = block_size
+        else:
+            B0 = x.shape[-2] // scale.shape[-2]
+            B1 = x.shape[-1] // scale.shape[-1]
+
+        for i, j in itertools.product(range(scale.shape[-2]), range(scale.shape[-1])):
+            blk_input = x[i * B0 : (i + 1) * B0, j * B1 : (j + 1) * B1]
+            blk_scale = scale[..., i, j]
+            expected_blk_scale = blk_input.abs().amax() / float8_max
+            assert torch.allclose(blk_scale, expected_blk_scale)
+
+            blk_output = output[i * B0 : (i + 1) * B0, j * B1 : (j + 1) * B1]
+            expected_blk_output = (blk_input / blk_scale).clamp(
+                -float8_max, float8_max
+            ).to(dtype).to(x.dtype) * blk_scale
+            assert torch.allclose(blk_output, expected_blk_output, atol=float8_tiny)
 
 
 def test_allow_overwrite(x):
     exponent_bits, mantissa_bits = 3, 4
-    q = FloatQuantizeDequantize(
-        exponent_bits, mantissa_bits, encoding_analyzer=MinMaxEncodingAnalyzer((1, 100))
-    )
+    q = FloatQuantizeDequantize(exponent_bits, mantissa_bits, shape=(1, 100))
     with q.compute_encodings():
         q(x)
     q_max = q.maxval.detach().clone()
@@ -221,41 +315,26 @@ def test_allow_overwrite(x):
     assert torch.equal(q.maxval, q_max * 2)
 
 
-@pytest.mark.parametrize(
-    "exponent_1, mantissa_1, encoding_analyzer_1",
-    [(1, 2, MinMaxEncodingAnalyzer((1, 3))), (3, 4, None)],
-)
-@pytest.mark.parametrize(
-    "exponent_2, mantissa_2, encoding_analyzer_2",
-    [(5, 6, MinMaxEncodingAnalyzer((1, 3))), (7, 8, None)],
-)
-def test_save_and_load_state_dict(
-    exponent_1,
-    mantissa_1,
-    encoding_analyzer_1,
-    exponent_2,
-    mantissa_2,
-    encoding_analyzer_2,
-):
-    qtzr_1 = FloatQuantizeDequantize(
-        exponent_1, mantissa_1, encoding_analyzer=encoding_analyzer_1
+def test_save_and_load_state_dict():
+    float8_e5m2_qtzr = FloatQuantizeDequantize(dtype=torch.float8_e5m2)
+    float8_e4m3fn_qtzr = FloatQuantizeDequantize(
+        dtype=torch.float8_e4m3fn, shape=(20, 20), block_size=(5, 5)
     )
-    dummy_input = torch.randn(1, 3)
-    with qtzr_1.compute_encodings():
-        qtzr_1(dummy_input)
 
-    qtzr_2 = FloatQuantizeDequantize(
-        exponent_2, mantissa_2, encoding_analyzer=encoding_analyzer_2
-    )
-    with qtzr_2.compute_encodings():
-        qtzr_2(dummy_input)
+    dummy_input = torch.randn(100, 100)
+    with float8_e5m2_qtzr.compute_encodings(), float8_e4m3fn_qtzr.compute_encodings():
+        _ = float8_e5m2_qtzr(dummy_input)
+        _ = float8_e4m3fn_qtzr(dummy_input)
+
     assert not torch.allclose(
-        qtzr_1(dummy_input), qtzr_2(dummy_input), atol=1e-7, rtol=1e-7
+        float8_e5m2_qtzr(dummy_input), float8_e4m3fn_qtzr(dummy_input)
     )
 
-    qtzr_1_state_dict = qtzr_1.state_dict()
-    qtzr_2.load_state_dict(qtzr_1_state_dict)
-    assert torch.equal(qtzr_1(dummy_input), qtzr_2(dummy_input))
+    float8_e5m2_qtzr.load_state_dict(float8_e4m3fn_qtzr.state_dict())
+    assert float8_e5m2_qtzr._finfo == float8_e4m3fn_qtzr._finfo == _float8_e4m3fn
+    assert float8_e5m2_qtzr.shape == float8_e4m3fn_qtzr.shape == (20, 20)
+    assert float8_e5m2_qtzr.block_size == float8_e4m3fn_qtzr.block_size == (5, 5)
+    assert torch.equal(float8_e5m2_qtzr(dummy_input), float8_e4m3fn_qtzr(dummy_input))
 
 
 def test_extreme_values_warning():
@@ -274,41 +353,104 @@ def test_extreme_values_warning():
         assert "Extreme values" in str(w[-1].message)
 
 
-def test_onnx_export():
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "shape, block_size",
+    [
+        [(1, 10), None],
+        [(10, 1), (1, 10)],
+        [(10, 2), (1, 5)],
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype, maxval",
+    [
+        (torch.float16, None),
+        (torch.float8_e5m2, None),
+        (torch.float8_e5m2, 16.0),
+    ],
+)
+def test_onnx_export(
+    dtype: torch.dtype,
+    maxval: float | None,
+    shape: tuple[int, ...],
+    block_size: tuple[int, ...] | None,
+    tmp_path: Path,
+):
     """
     When: torch.onnx.export a quantizer
     Then: export shouldn't throw error
     """
-    qdq = FloatQuantizeDequantize(dtype=torch.float16)
-    with tempfile.TemporaryFile() as f:
-        torch.onnx.export(qdq, torch.randn(10, 10), f, dynamo=False)
+    qdq = FloatQuantizeDequantize(dtype=dtype, shape=shape, block_size=block_size)
+    x = torch.randn(10, 10)
+
+    if maxval is not None:
+        qdq.maxval = torch.full(shape, maxval)
+
+    model = torch.nn.Sequential(torch.nn.Sigmoid(), qdq)
+    torch.onnx.export(
+        model,
+        (x,),
+        tmp_path / "float_qdq_pre.onnx",
+        dynamo=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
+    onnx_qdq_model = onnx.load(tmp_path / "float_qdq_pre.onnx")
+    onnx.checker.check_model(onnx_qdq_model)
+
+    aimet_torch.onnx.export(
+        model,
+        (x,),
+        tmp_path / "float_qdq.onnx",
+        dynamo=False,
+        input_names=["input"],
+        output_names=["output"],
+        opset_version=21,
+    )
+    onnx_qdq_model = onnx.load(tmp_path / "float_qdq.onnx")
+    onnx.checker.check_model(onnx_qdq_model)
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        onnx_qdq_model.SerializeToString(),
+        providers=["CPUExecutionProvider"],
+        sess_options=sess_options,
+    )
+    (out,) = sess.run(None, {"input": x.detach().numpy()})
+
+    if dtype == torch.float8_e5m2:
+        expected_out = qdq(torch.sigmoid(x))
+    else:
+        # float16 quantizer won't be actually exported to onnx QDQ.
+        expected_out = torch.sigmoid(x)
+
+    assert torch.allclose(torch.from_numpy(out), expected_out)
 
 
 def test_float_encoding_to():
     """
-    Given: FloatEncoding with maxval=None
-    When: Call .to()
-    Then: Should return identical object
+    When: FloatEncoding with scale=None
+    Then: Throw ValueError
     """
-    encoding = FloatEncoding(
-        exponent_bits=5,
-        mantissa_bits=10,
-        finite=False,
-        unsigned_zero=False,
-        maxval=None,
-    )
-    new_encoding = encoding.to(device="cpu", dtype=torch.float16)
-    assert new_encoding is encoding
+    with pytest.raises(ValueError):
+        encoding = FloatEncoding(
+            exponent_bits=5,
+            mantissa_bits=10,
+            finite=False,
+            unsigned_zero=False,
+            scale=None,
+        )
 
     """
-    Given: FloatEncoding with maxval=None
+    Given: FloatEncoding with scale!=None
     """
     encoding = FloatEncoding(
         exponent_bits=5,
         mantissa_bits=10,
         finite=False,
         unsigned_zero=False,
-        maxval=torch.tensor(124.0),
+        scale=torch.tensor(0.1),
     )
     """
     When: Call .to() with same dtype and device

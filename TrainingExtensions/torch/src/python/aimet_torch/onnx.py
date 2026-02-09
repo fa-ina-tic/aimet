@@ -6,6 +6,7 @@
 
 import contextlib
 import io
+import itertools
 from aimet_torch.v2.quantization.affine.encoding import AffineEncoding
 from packaging import version
 import traceback
@@ -33,12 +34,13 @@ from .quantsim import QuantizationSimModel
 from .v2.experimental import onnx as _onnx
 
 
+_TORCH_VERSION = version.parse(torch.__version__)
 _TORCH_DEFAULT_OPSET = _constants.ONNX_DEFAULT_OPSET
 _TORCH_MIN_OPSET = _constants.ONNX_MIN_OPSET
 _TORCH_MAX_OPSET = _constants.ONNX_MAX_OPSET
 
 # Allow at least up to opset 21 to enable [u]int16 QDQ export
-_AIMET_MAX_OPSET = max(_TORCH_MAX_OPSET, 21)
+_AIMET_MAX_OPSET = max(_TORCH_MAX_OPSET, 23)
 
 
 @torch.no_grad()
@@ -109,7 +111,7 @@ def export(
     base_dir = str(Path(str(f)).absolute().parent)
 
     _check_opset_version(kwargs)
-    _check_unsupported_args(kwargs)
+    _check_unsupported_args(model, kwargs)
     _check_non_standard_quantizer(model)
 
     target_version = kwargs.pop("opset_version", _TORCH_DEFAULT_OPSET)
@@ -130,6 +132,7 @@ def export(
 
         # Export quantize-dequantized weight
         # pylint: disable=protected-access
+        stack.enter_context(_temporarily_convert_activation_to_uint(model))
         stack.enter_context(QuantizationSimModel._apply_qdq_to_model_parameters(model))
 
         # Remove [b]float16 quantizers
@@ -253,12 +256,20 @@ def _check_opset_version(kwargs):
         raise ValueError(f"Unsupported ONNX opset version: {opset_version}")
 
 
-def _check_unsupported_args(kwargs):
-    dynamo = kwargs.get(
-        "dynamo", version.parse(torch.__version__) >= version.parse("2.9.0")
-    )
+def _check_unsupported_args(model, kwargs):
+    if _TORCH_VERSION >= version.parse("2.0.0") and isinstance(
+        model,
+        torch._dynamo.OptimizedModule,  # pylint: disable=protected-access
+    ):
+        if _TORCH_VERSION < version.parse("2.11.0.dev"):
+            raise RuntimeError(
+                "Exporting a torch.compile-d quantsim model is only supported in torch >= 2.11.0. "
+                "For more information, see https://github.com/pytorch/pytorch/issues/171674"
+            )
 
-    if dynamo and version.parse(torch.__version__) < version.parse("2.8.0"):
+    dynamo = kwargs.get("dynamo", _TORCH_VERSION >= version.parse("2.9.0"))
+
+    if dynamo and _TORCH_VERSION < version.parse("2.8.0"):
         raise RuntimeError("AIMET dynamo export is only supported in torch >= 2.8.0")
 
     export_params = kwargs.get("export_params", True)
@@ -377,8 +388,6 @@ def _to_onnx(
     f: Union[str, io.BytesIO],
     **kwargs,
 ) -> Tuple[onnx.ModelProto, dict]:
-    _check_float16_quantizers(model)
-
     _onnx.export(model, args, f, **kwargs)
     onnx_model = onnx.load(f, load_external_data=False)
     aliases = _duplicate_shared_qdq_inputs(onnx_model)
@@ -673,3 +682,29 @@ def _absorb_zero_point_shift(model: torch.nn.Module):
             min = new_scale * qtzr.qmin
             max = new_scale * qtzr.qmax
             qtzr.set_range(min, max)
+
+
+@contextlib.contextmanager
+def _temporarily_convert_activation_to_uint(model: torch.nn.Module):
+    """
+    Temporarily convert all signed activation quantizers to unsigned ones for onnx export.
+
+    TODO: This is a temporary workaround for QAIRT/HTP bug in handling signed activation encodings.
+          Remove this once the bug is fixed.
+          (https://github.qualcomm.com/qualcomm-ai/aimet/issues/5236)
+    """
+    signed_int_activation_quantizers = [
+        qtzr
+        for module in model.modules()
+        if isinstance(module, QuantizationMixin)
+        for qtzr in itertools.chain(module.input_quantizers, module.output_quantizers)
+        if isinstance(qtzr, AffineQuantizerBase) and qtzr.signed
+    ]
+
+    try:
+        for qtzr in signed_int_activation_quantizers:
+            qtzr.signed = False
+        yield
+    finally:
+        for qtzr in signed_int_activation_quantizers:
+            qtzr.signed = True

@@ -55,6 +55,7 @@ from aimet_onnx.common.onnx._utils import (
     _remove_onnx_qdq_nodes,
     _is_grid_preserving_op,
     _derive_data_movement_op_encodings,
+    _is_htp_interpolation_op,
 )
 from aimet_onnx.common.quantsim import (
     extract_global_quantizer_args,
@@ -139,19 +140,10 @@ allowed_op_type_for_per_channel = ["Conv", "Gemm", "MatMul", "ConvTranspose"]
 # List of op types whose input and output quantizers to be tied
 op_types_to_tie_qtzrs = [
     "Concat",
-    "CropAndResize",
-    "MaxPool",
     "AveragePool",
-    "Resize",
-    "Max",
-    "ReduceMax",
     "Relu",
-    "Min",
-    "ReduceMin",
-    "ScatterElements",
-    "Upsample",
 ]
-_tie_qtzrs = False
+_tie_qtzrs = True
 
 data_types_to_quantize = [np.float32, np.float16]
 
@@ -490,7 +482,11 @@ class QuantizationSimModel:
         self._apply_param_symmetry_to_inputs(quantsim_configurator)
         self._apply_exception_rules()
         if _tie_qtzrs:
-            self._tie_quantizers_for_op_types(op_types_to_tie_qtzrs)
+            op_types = {node.op_type for node in self.model.nodes()}
+            op_types_to_tie = op_types_to_tie_qtzrs + [
+                t for t in op_types if _is_htp_interpolation_op(t)
+            ]
+            self._tie_quantizers_for_op_types(op_types_to_tie)
 
         # Always tie RNN hidden state quantizers regardless of _tie_qtzrs flag
         self._tie_rnn_hidden_state_quantizers()
@@ -2123,48 +2119,49 @@ class QuantizationSimModel:
             for out in op.outputs:
                 output_qtzr = self.qc_quantize_op_dict.get(out.name)
 
-                if output_qtzr and output_qtzr.enabled:
-                    # If output quantizer already exists,
-                    # "merge" the quantization constraints into single quantizer
-                    #
-                    # This logic was added specifically to resolve conflicting
-                    # constraints between Softmax output and the second input of MatMul.
-                    #   Softmax ------------> ... ------------> MatMul
-                    #             [0, 1]            symmetric
-                    #
-                    # Ideally, this conflict should be resolved by
-                    # simulating & exporting two independent quantizers like this:
-                    #   Softmax ---> QDQ ------> QDQ ---> MatMul
-                    #               [0, 1]     symmetric
-                    #
-                    # However, this is currently not allowed by QAIRT.
-                    # As an ad-hoc workaround, we "merge" the two configurations as below:
-                    #   Softmax ---------> QDQ ---------> MatMul
-                    #                    [-1, 1]
-                    #                    symmetric
+                # If output is not quantized (e.g., part of supergroup) do not propagate
+                if not (output_qtzr and output_qtzr.enabled):
+                    continue
 
-                    if (
-                        output_qtzr._encoding_min_max_fixed_vals
-                        and output_qtzr._encoding_min_max_fixed_vals
-                        != input_qtzr._encoding_min_max_fixed_vals
-                    ):
-                        path = self._get_path_to_effective_quantizer(
-                            op.get_module().input[0]
-                        )
-                        if path and any(
-                            n_consumers[node.output[0]] != 1 for node in path
-                        ):
-                            # Input is consumed by multiple consumers when output range is constrained.
-                            # For example:
-                            #                           [0, ?]
-                            #   Conv ---> Q1 -+-> Relu -> Q2
-                            #                 +-> Add --> Q3
-                            #
-                            # In this case, we skip tying Q1 and Q2
-                            # as it can lead to catastrophic accuracy drop.
-                            continue
+                # If output quantizer already exists,
+                # "merge" the quantization constraints into single quantizer
+                #
+                # This logic was added specifically to resolve conflicting
+                # constraints between Softmax output and the second input of MatMul.
+                #   Softmax ------------> ... ------------> MatMul
+                #             [0, 1]            symmetric
+                #
+                # Ideally, this conflict should be resolved by
+                # simulating & exporting two independent quantizers like this:
+                #   Softmax ---> QDQ ------> QDQ ---> MatMul
+                #               [0, 1]     symmetric
+                #
+                # However, this is currently not allowed by QAIRT.
+                # As an ad-hoc workaround, we "merge" the two configurations as below:
+                #   Softmax ---------> QDQ ---------> MatMul
+                #                    [-1, 1]
+                #                    symmetric
 
-                    input_qtzr._merge_constraints(output_qtzr)
+                if (
+                    output_qtzr._encoding_min_max_fixed_vals
+                    and output_qtzr._encoding_min_max_fixed_vals
+                    != input_qtzr._encoding_min_max_fixed_vals
+                ):
+                    path = self._get_path_to_effective_quantizer(
+                        op.get_module().input[0]
+                    )
+                    if path and any(n_consumers[node.output[0]] != 1 for node in path):
+                        # Input is consumed by multiple consumers when output range is constrained.
+                        # For example:
+                        #                           [0, ?]
+                        #   Conv ---> Q1 -+-> Relu -> Q2
+                        #                 +-> Add --> Q3
+                        #
+                        # In this case, we skip tying Q1 and Q2
+                        # as it can lead to catastrophic accuracy drop.
+                        continue
+
+                input_qtzr._merge_constraints(output_qtzr)
 
                 self._set_quantizer(out.name, node_input_map, input_qtzr)
 

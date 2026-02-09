@@ -41,13 +41,16 @@ from aimet_torch.v2.quantization.affine.backends import (
     quantize,
     quantize_dequantize,
     dequantize,
-    torch_builtins,
     _derive_qmin_qmax,
 )
 from aimet_torch.v2.utils import ste_round
 from aimet_torch.v2.deepspeed_utils import SafeGatheredParameters
 from aimet_torch.common.quantsim import _get_minimum_scale
 from ._utils import _GridMixin, _register_signature
+from aimet_torch.v2.quantization._utils import (
+    interleave,
+    concretize_block_size,
+)
 
 
 __all__ = [
@@ -71,7 +74,7 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
         symmetric (bool): If True, performs symmetric quantization;
                           otherwise, performs asymmetric quantization
         encoding_analyzer (EncodingAnalyzer, optional): Encoding analyzer for calibrating quantization encodings
-                                                        (default: absolute min-max encoding analyzer)
+                                                        (default: min-max encoding analyzer)
 
     """
 
@@ -166,12 +169,11 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
             )
 
         self.encoding_analyzer = encoding_analyzer or MinMaxEncodingAnalyzer(
-            torch_builtins.get_encoding_shape_with_blocks(self.shape, self.block_size)
+            shape=self.shape,
+            block_size=self.block_size,
         )
 
-        if self.block_size is None and not _is_expandable(
-            self.encoding_analyzer.observer.shape, self.shape
-        ):
+        if not _is_expandable(self.encoding_analyzer.observer.shape, self.shape):
             raise RuntimeError(
                 f"Encoding analyzer of shape {self.encoding_analyzer.observer.shape} "
                 f"is incompatible with quantizer of shape {self.shape}."
@@ -447,6 +449,7 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
                 self.block_size,
                 self.zero_point_shift,
             )
+
         return None
 
     @classmethod
@@ -592,12 +595,9 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
             raise RuntimeError from e
 
         @functools.wraps(original_forward)
-        def forward_wrapper(input):
+        def forward_wrapper(input: torch.Tensor) -> torch.Tensor:
             input = input.as_subclass(torch.Tensor)
-            expanded_input = torch_builtins.reshape_tensor_for_blocks(
-                input, shape, self.block_size
-            )
-            batch_statistics = self.encoding_analyzer.update_stats(expanded_input)
+            batch_statistics = self.encoding_analyzer.update_stats(input)
             num_steps = self.qmax - self.qmin
             if self.zero_point_shift == 0.5:
                 num_steps -= 1
@@ -665,6 +665,96 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
             enc_max = None
 
         self.set_range(enc_min, enc_max)
+
+    def load_state_dict(self, state_dict, strict: bool = True, **kwargs):  # pylint:disable=arguments-differ
+        # pylint: disable=attribute-defined-outside-init, access-member-before-definition
+        if strict:
+            return super().load_state_dict(state_dict, strict, **kwargs)
+
+        if "min" in state_dict or "max" in state_dict:
+            is_minmax_state_dict = True
+        elif "scale" in state_dict or "offset" in state_dict:
+            is_minmax_state_dict = False
+        else:
+            # Mal-formed state dict; call super() to raise error
+            return super().load_state_dict(state_dict, strict, **kwargs)
+
+        if self._is_min_max_quantizer() != is_minmax_state_dict:
+            raise RuntimeError
+
+        if self._is_min_max_quantizer():
+            new_min = state_dict.get("min")
+            new_max = state_dict.get("max")
+
+            if new_min is not None and new_min.shape != self.min.shape:
+                self.min = torch.nn.Parameter(
+                    new_min.clone().to(device=self.min.device, dtype=self.min.dtype)
+                )
+
+            if new_max is not None and new_max.shape != self.max.shape:
+                self.max = torch.nn.Parameter(
+                    new_max.clone().to(device=self.max.device, dtype=self.max.dtype)
+                )
+        else:
+            new_scale = state_dict.get("scale")
+            new_offset = state_dict.get("offset")
+
+            if new_scale is not None and new_scale.shape != self.scale.shape:
+                self.scale = torch.nn.Parameter(
+                    new_scale.clone().to(
+                        device=self.scale.device, dtype=self.scale.dtype
+                    )
+                )
+
+            if new_offset is not None and (
+                self.offset is None or new_offset.shape != self.offset.shape
+            ):
+                device = (
+                    self.scale.device if self.offset is None else self.offset.device
+                )
+                dtype = self.scale.dtype if self.offset is None else self.offset.device
+                self.offset = torch.nn.Parameter(
+                    new_offset.clone().to(device=device, dtype=dtype)
+                )
+
+        return super().load_state_dict(state_dict, strict, **kwargs)
+
+    def get_extra_state(self):
+        if torch.onnx.is_in_onnx_export():
+            # Bypass get_extra_state during ONNX export.
+            # ONNX export doesn't support non-tensor objects in state_dict
+            # Return empty tensor since extra state is unnecessary for ONNX export anyway
+            return torch.tensor([])
+
+        extra_state = super().get_extra_state()
+        extra_state.update(
+            {
+                "qmin": torch.tensor(self.qmin),
+                "qmax": torch.tensor(self.qmax),
+                "symmetric": torch.tensor(self.symmetric),
+                "block_size": torch.tensor(self.block_size or ()),
+                "zero_point_shift": torch.tensor(self.zero_point_shift),
+            }
+        )
+        return extra_state
+
+    def set_extra_state(self, state):
+        super().set_extra_state(state)
+
+        if "qmin" in state:
+            self.qmin = state.pop("qmin").item()
+        if "qmax" in state:
+            self.qmax = state.pop("qmax").item()
+        if "symmetric" in state:
+            self.symmetric = state.pop("symmetric").item()
+        if "block_size" in state:
+            self.block_size = tuple(state.pop("block_size")) or None
+        if "zero_point_shift" in state:
+            self.zero_point_shift = state.pop("zero_point_shift").item()
+
+        self.shape = tuple(
+            self.min.shape if self._is_min_max_quantizer() else self.scale.shape
+        )
 
 
 def _get_symmetric_offset(qmin, qmax, shape, dtype, device):
@@ -782,7 +872,7 @@ class Quantize(AffineQuantizerBase):
         symmetric (bool): If True, performs symmetric quantization;
                           otherwise, performs asymmetric quantization
         encoding_analyzer (EncodingAnalyzer, optional): Encoding analyzer for calibrating quantization encodings
-                                                        (default: absolute min-max encoding analyzer)
+                                                        (default: min-max encoding analyzer)
         block_size (Tuple[int, ...], optional): Block size
 
     :ivar Tensor min: :math:`\theta_{min}` from which scale and offset will be derived.
@@ -912,7 +1002,7 @@ class QuantizeDequantize(AffineQuantizerBase):
         symmetric (bool): If True, performs symmetric quantization;
                           otherwise, performs asymmetric quantization
         encoding_analyzer (EncodingAnalyzer, optional): Encoding analyzer for calibrating quantization encodings
-                                                        (default: absolute min-max encoding analyzer)
+                                                        (default: min-max encoding analyzer)
         block_size (Tuple[int, ...], optional): Block size
 
     :ivar Tensor min: :math:`\theta_{min}` from which scale and offset will be derived.
@@ -1071,7 +1161,7 @@ class GroupedBlockQuantizeDequantize(QuantizeDequantize):  # pylint: disable=too
         :param decompressed_bw: Bitwidth used for decompression
         :type decompressed_bw: int
         :param encoding_analyzer: Encoding analyzer for calibrating quantization encodings
-                                  (default: absolute min-max encoding analyzer)
+                                  (default: min-max encoding analyzer)
         :type encoding_analyzer: EncodingAnalyzer, optional
         :param block_size: Block size per dimension.
         :type block_size: Tuple
@@ -1162,9 +1252,14 @@ class GroupedBlockQuantizeDequantize(QuantizeDequantize):  # pylint: disable=too
             s_dim // group_size if group_size != -1 else 1
             for s_dim, group_size in zip(raw_scale.shape, self.block_grouping)
         ]
-        reshaped_scale = torch_builtins.reshape_tensor_for_blocks(
-            raw_scale, per_channel_scale_shape, self.block_grouping
+        block_grouping = concretize_block_size(
+            raw_scale.shape, per_channel_scale_shape, self.block_grouping
         )
+        reshaped_scale = raw_scale.reshape(
+            *raw_scale.shape[: raw_scale.dim() - len(per_channel_scale_shape)],
+            *interleave(per_channel_scale_shape, block_grouping),
+        )
+
         max_scale = torch.amax(
             reshaped_scale, dim=tuple(range(1, reshaped_scale.dim(), 2))
         )

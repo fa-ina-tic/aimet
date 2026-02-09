@@ -4,6 +4,7 @@
 
 """Utility APIs for onnx export"""
 
+from __future__ import annotations
 from contextlib import contextmanager, ExitStack
 from collections import defaultdict
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ import functools
 import math
 import numpy as np
 import os
-from typing import Any, Sequence, Iterable, Optional, Mapping
+from typing import Any, Sequence, Iterable, Optional, Mapping, TYPE_CHECKING
 
 import onnx
 from onnx.external_data_helper import _get_all_tensors
@@ -32,7 +33,22 @@ except ImportError:
 
 from aimet_torch.v2.utils import patch_attr
 
-ONNX_QUANTIZER_OP_TYPES = ("quantize", "quantize_dequantize", "QuantizeDequantize")
+if TYPE_CHECKING:
+    from aimet_torch.v2.quantization.base.encoding import (
+        EncodingBase,
+        FloatEncoding,
+        AffineEncoding,
+    )
+    from aimet_torch.v2.quantization.affine import AffineEncoding
+    from aimet_torch.v2.quantization.float import FloatEncoding
+    from aimet_torch.v2.quantization.float._finfo import _finfo
+
+ONNX_QUANTIZER_OP_TYPES = (
+    "quantize",
+    "quantize_dequantize",
+    "QuantizeDequantize",
+    "FloatQuantizeDequantize",
+)
 aimet_opset = onnxscript.values.Opset(domain="aimet", version=1)
 _is_torch_2 = version.parse(torch.__version__) >= version.parse("2.0.0")
 
@@ -113,6 +129,61 @@ onnx.defs.register_schema(
 )
 
 
+onnx.defs.register_schema(
+    onnx.defs.OpSchema(
+        name="FloatQuantizeDequantize",
+        domain="aimet",
+        since_version=1,
+        doc="Floating-point Quantize and Dequantize operation as defined in AIMET.",
+        inputs=[
+            onnx.defs.OpSchema.FormalParameter(
+                name="tensor",
+                type_str="T",
+                description="Input tensor to be quantized and dequantized",
+            ),
+            onnx.defs.OpSchema.FormalParameter(
+                name="scale",
+                type_str="T",
+                description="Scale tensor for quantization",
+            ),
+        ],
+        outputs=[
+            onnx.defs.OpSchema.FormalParameter(
+                name="output",
+                type_str="T",
+                description="Quantized and dequantized output tensor",
+            )
+        ],
+        type_constraints=[
+            (
+                "T",
+                [
+                    "tensor(float)",
+                    "tensor(double)",
+                    "tensor(float16)",
+                    "tensor(bfloat16)",
+                ],
+                "Constrain input and output types to numeric tensors.",
+            )
+        ],
+        attributes=[
+            onnx.defs.OpSchema.Attribute(
+                name="dtype",
+                type=onnx.defs.OpSchema.AttrType.INT,
+                description="ONNX float4/8 data type. Choices: FLOAT4E2M1, FLOAT8E4M3FN, FLOAT8E4M3FNUZ, FLOAT8E5M2, FLOAT8E5M2FNUZ",
+                required=True,
+            ),
+            onnx.defs.OpSchema.Attribute(
+                name="block_size",
+                type=onnx.defs.OpSchema.AttrType.INTS,
+                description="Block size",
+                required=False,
+            ),
+        ],
+    )
+)
+
+
 @onnxscript.script(aimet_opset, default_opset=onnxscript.opset1)
 def _quantize_dequantize_placeholder(
     tensor: onnxscript.FLOAT,
@@ -120,7 +191,7 @@ def _quantize_dequantize_placeholder(
     offset: onnxscript.FLOAT,
     qmin: int,
     qmax: int,
-    block_size: Sequence[int] = (1,),
+    block_size: Sequence[int] = (),
     zero_point_shift: float = 0.0,
 ) -> onnxscript.FLOAT:
     return aimet_opset.QuantizeDequantize(
@@ -137,7 +208,7 @@ def _quantize_dequantize_placeholder(
 def _quantize_template(opset: onnxscript.values.Opset) -> onnxscript.OnnxFunction:
     @onnxscript.script(aimet_opset, default_opset=opset)
     def quantize(
-        tensor, scale, offset, qmin: int, qmax: int, block_size: Sequence[int]
+        tensor, scale, offset, qmin: int, qmax: int, block_size: Sequence[int] = (1,)
     ):
         """Onnxscript implementation of affine quantize"""
         # Upscale scale/offset by the factor of block_size
@@ -160,7 +231,7 @@ def _quantize_template(opset: onnxscript.values.Opset) -> onnxscript.OnnxFunctio
 
 def _dequantize_template(opset: onnxscript.values.Opset) -> onnxscript.OnnxFunction:
     @onnxscript.script(aimet_opset, default_opset=opset)
-    def dequantize(tensor, scale, offset, block_size: Sequence[int]):
+    def dequantize(tensor, scale, offset, block_size: Sequence[int] = (1,)):
         """Onnxscript implementation of affine dequantize"""
         # Upscale scale/offset by the factor of block_size
         upscaled_shape = opset.Shape(scale) * block_size
@@ -189,8 +260,8 @@ def _quantize_dequantize_template(
         offset,
         qmin: int,
         qmax: int,
-        block_size: Sequence[int],
-        zero_point_shift: float,
+        block_size: Sequence[int] = (1,),
+        zero_point_shift: float = 0.0,
     ):
         """Onnxscript implementation of affine quantize-dequantize"""
         # Upscale scale/offset by the factor of block_size
@@ -289,26 +360,10 @@ def quantize_symbolic(g, tensor, scale, offset, qmin, qmax, block_size=None):
     scale = _unsqueeze_scalar(g, scale)
     offset = _unsqueeze_scalar(g, offset)
 
-    if block_size is None:
-        block_size = (1,)
+    if block_size is not None:
+        from aimet_torch.v2.quantization._utils import concretize_block_size
 
-    if any(b == -1 for b in block_size):
-        # Concretize wildcard block sizes
-        old_block_size = block_size
-        new_block_size = list(
-            reversed(
-                [
-                    input_dim // num_blocks
-                    for input_dim, num_blocks in zip(
-                        _shape(tensor)[::-1], _shape(scale)[::-1]
-                    )
-                ]
-            )
-        )
-        assert all(
-            old == new for old, new in zip(old_block_size, new_block_size) if old != -1
-        )
-        block_size = new_block_size
+        block_size = concretize_block_size(_shape(tensor), _shape(scale), block_size)
 
     if not _is_torch_2:
         # For torch <2, insert dummy placeholder node instead of
@@ -372,26 +427,10 @@ def dequantize_symbolic(g, tensor, scale, offset, block_size=None):
     scale = _unsqueeze_scalar(g, scale)
     offset = _unsqueeze_scalar(g, offset)
 
-    if block_size is None:
-        block_size = (1,)
+    if block_size is not None:
+        from aimet_torch.v2.quantization._utils import concretize_block_size
 
-    if any(b == -1 for b in block_size):
-        # Concretize wildcard block sizes
-        old_block_size = block_size
-        new_block_size = list(
-            reversed(
-                [
-                    input_dim // num_blocks
-                    for input_dim, num_blocks in zip(
-                        _shape(tensor)[::-1], _shape(scale)[::-1]
-                    )
-                ]
-            )
-        )
-        assert all(
-            old == new for old, new in zip(old_block_size, new_block_size) if old != -1
-        )
-        block_size = new_block_size
+        block_size = concretize_block_size(_shape(tensor), _shape(scale), block_size)
 
     if not _is_torch_2:
         # For torch <2, insert dummy placeholder node instead of
@@ -450,26 +489,10 @@ def quantize_dequantize_symbolic(
     scale = _unsqueeze_scalar(g, scale)
     offset = _unsqueeze_scalar(g, offset)
 
-    if block_size is None:
-        block_size = (1,)
+    if block_size is not None:
+        from aimet_torch.v2.quantization._utils import concretize_block_size
 
-    if any(b == -1 for b in block_size):
-        # Concretize wildcard block sizes
-        old_block_size = block_size
-        new_block_size = list(
-            reversed(
-                [
-                    input_dim // num_blocks
-                    for input_dim, num_blocks in zip(
-                        _shape(tensor)[::-1], _shape(scale)[::-1]
-                    )
-                ]
-            )
-        )
-        assert all(
-            old == new for old, new in zip(old_block_size, new_block_size) if old != -1
-        )
-        block_size = new_block_size
+        block_size = concretize_block_size(_shape(tensor), _shape(scale), block_size)
 
     if not _is_torch_2:
         # For torch <2, insert dummy placeholder node instead of
@@ -511,6 +534,54 @@ def quantize_dequantize_symbolic(
         qmax_i=qmax,
         block_size_i=block_size,
         zero_point_shift_f=zero_point_shift,
+    ).setType(tensor.type())
+
+
+def float_quantize_dequantize_symbolic(
+    g, tensor, finfo: _finfo, scale, block_size=None
+):
+    """Onnx symbolic function definition for affine quantize-dequantize"""
+    onnx_float_dtype = finfo.to_onnx_dtype()
+
+    if not _is_torch_2:
+        # torch <2 passes torch._C.Graph object instead of GraphContext.
+        # Temporarily wrap torch._C.Graph with GraphContext
+        from torch.onnx.utils import _params_dict
+
+        g = GraphContext(
+            graph=g,
+            block=g.block(),
+            opset=GLOBALS.export_onnx_opset_version,
+            original_node=None,
+            params_dict=_params_dict,
+            env={},
+        )
+
+    scale = _unsqueeze_scalar(g, scale)
+
+    if block_size is not None:
+        from aimet_torch.v2.quantization._utils import concretize_block_size
+
+        block_size = concretize_block_size(_shape(tensor), _shape(scale), block_size)
+
+    if not _is_torch_2:
+        # For torch <2, insert dummy placeholder node instead of
+        # a runnable onnxscript function since
+        # torch 1.x doesn't support adding onnxscript function to onnx graph
+        return g.op(
+            "aimet::FloatQuantizeDequantize",
+            tensor,
+            scale,
+            block_size_i=block_size,
+            dtype_i=onnx_float_dtype,
+        ).setType(tensor.type())
+
+    return g.onnxscript_op(
+        aimet_opset.FloatQuantizeDequantize,
+        tensor,
+        scale,
+        dtype_i=onnx_float_dtype,
+        block_size_i=block_size,
     ).setType(tensor.type())
 
 
@@ -567,7 +638,7 @@ def export(
 
 def remove_quantization_nodes_from_onnx_graph(
     model: onnx.ModelProto, base_dir: Optional[str] = None
-):  # pylint: disable=too-many-locals, too-many-branches
+) -> dict[str, EncodingBase]:  # pylint: disable=too-many-locals, too-many-branches
     """
     Remove quantization nodes from ONNX graph with quantization nodes
     :param model: ONNX model with quantization nodes
@@ -577,7 +648,9 @@ def remove_quantization_nodes_from_onnx_graph(
         model
     )
     qtzr_nodes = list(
-        node for node in model.graph.node if node.op_type in ONNX_QUANTIZER_OP_TYPES
+        node
+        for node in model.graph.node
+        if node.domain == "aimet" and node.op_type in ONNX_QUANTIZER_OP_TYPES
     )
     constants = {const.name: const for const in _get_all_tensors(model) if const.name}
     constants |= {
@@ -744,20 +817,79 @@ def _get_encoding_from_onnx_node(
     constants: Mapping[str, onnx.TensorProto],
     quant_node: onnx.NodeProto,
     base_dir: Optional[str] = None,
-):
+) -> EncodingBase:
     """
     Get encoding from quantization node.
     """
-    # pylint: disable=import-outside-toplevel, protected-access
+    assert (
+        quant_node.domain == "aimet" and quant_node.op_type in ONNX_QUANTIZER_OP_TYPES
+    )
+
+    if quant_node.op_type == "FloatQuantizeDequantize":
+        return _get_float_encoding_from_onnx_node(
+            constants, quant_node, base_dir=base_dir
+        )
+    else:
+        return _get_affine_encoding_from_onnx_node(
+            constants, quant_node, base_dir=base_dir
+        )
+
+
+def _get_float_encoding_from_onnx_node(
+    constants: Mapping[str, onnx.TensorProto],
+    quant_node: onnx.NodeProto,
+    base_dir: Optional[str] = None,
+) -> FloatEncoding:
+    from aimet_torch.v2.quantization.float import FloatEncoding
+    from aimet_torch.v2.quantization.float._finfo import _finfo
+
+    finfo = None
+    block_size = None
+
+    for attr in quant_node.attribute:
+        if attr.name == "dtype":
+            finfo = _finfo.from_onnx_dtype(attr.i)
+        if attr.name == "block_size":
+            block_size = tuple(attr.ints) or None
+
+    if finfo is None:
+        raise RuntimeError(
+            f"Cannot find 'dtype' attribute in FloatQuantizeDequantize node {quant_node.name}"
+        )
+
+    scale_name = quant_node.input[1]
+
+    if scale_name in constants:
+        scale = torch.tensor(
+            onnx.numpy_helper.to_array(constants[scale_name], base_dir=base_dir)
+        )
+    else:
+        raise RuntimeError(f"Cannot find constant with name {scale_name} in onnx model")
+
+    return FloatEncoding(
+        finfo.mantissa_bits,
+        finfo.exponent_bits,
+        finfo.finite,
+        finfo.unsigned_zero,
+        scale=scale,
+        block_size=block_size,
+    )
+
+
+def _get_affine_encoding_from_onnx_node(
+    constants: Mapping[str, onnx.TensorProto],
+    quant_node: onnx.NodeProto,
+    base_dir: Optional[str] = None,
+) -> AffineEncoding:
+    # pylint: disable=protected-access
     from aimet_torch.v2.quantization.affine.encoding import (
         AffineEncoding,
         GroupedBlockEncoding,
     )
 
-    assert quant_node.op_type in ONNX_QUANTIZER_OP_TYPES
-
     qmin, qmax, block_size, zero_point_shift = None, None, None, None
     scale_name, offset_name = quant_node.input[1], quant_node.input[2]
+    block_size = None
 
     for attr in quant_node.attribute:
         if attr.name == "qmin":
@@ -765,9 +897,7 @@ def _get_encoding_from_onnx_node(
         if attr.name == "qmax":
             qmax = attr.i
         if attr.name == "block_size":
-            block_size = attr.ints
-            if block_size == [1]:
-                block_size = None
+            block_size = tuple(attr.ints) or None
         if attr.name == "zero_point_shift":
             zero_point_shift = attr.f
 
@@ -804,11 +934,12 @@ def _get_encoding_from_onnx_node(
         zero_point_shift=zero_point_shift,
     )
 
-    try:
-        # Try converting affine encoding to LPBQ encoding if possible
-        encoding = GroupedBlockEncoding._from_affine_encoding(encoding)
-    except ValueError:
-        pass
+    if block_size and symmetry:
+        try:
+            # Try converting affine encoding to LPBQ encoding if possible
+            encoding = GroupedBlockEncoding._from_affine_encoding(encoding)
+        except ValueError:
+            pass
 
     return encoding
 
@@ -860,6 +991,12 @@ def _precompute_encodings(model: torch.nn.Module):
     def get_cached_encodings(q: QuantizerBase):
         return encodings[q]
 
+    def get_cached_scale(q: QuantizerBase):
+        enc = get_cached_encodings(q)
+        if enc:
+            return enc.scale
+        return None
+
     with ExitStack() as stack:
         for q in model.modules():
             if isinstance(q, QuantizerBase):
@@ -871,5 +1008,8 @@ def _precompute_encodings(model: torch.nn.Module):
                 ctx = patch_attr(
                     q, "is_initialized", functools.partial(is_initialized, q)
                 )
+                stack.enter_context(ctx)
+
+                ctx = patch_attr(q, "get_scale", functools.partial(get_cached_scale, q))
                 stack.enter_context(ctx)
         yield
