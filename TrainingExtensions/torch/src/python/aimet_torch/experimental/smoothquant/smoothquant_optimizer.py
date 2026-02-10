@@ -134,3 +134,5 @@ class Smoothquant:
                 _smooth_ln_fcs(ffn_ln, fcs, fcs_input_scale, alpha)
 
         return None
+
+apply_smoothquant = Smoothquant.apply_smoothquant
