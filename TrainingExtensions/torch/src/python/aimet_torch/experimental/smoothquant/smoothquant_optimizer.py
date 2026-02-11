@@ -22,7 +22,7 @@ class Smoothquant:
     @classmethod
     def apply_smoothquant(
         cls,
-        quant_sim: QuantizationSimModel,
+        model: torch.nn.Module,
         dataloader: DataLoader,
         alpha: float = 0.5,
         num_iterations: int = 512,
@@ -33,15 +33,14 @@ class Smoothquant:
 
         start_smq_optmztn_time = time.perf_counter()
         act_scales = cls._get_act_scales(
-            quant_sim,
+            model,
             dataloader,
             num_iterations,
         )
         cls._smooth_lm(
-            quant_sim,
+            model,
             act_scales,
             alpha,
-            output_path
         )
         
         total_smq_optmztn_time = time.perf_counter() - start_smq_optmztn_time
@@ -49,13 +48,14 @@ class Smoothquant:
         return None
     
     @classmethod
+    @torch.no_grad()
     def _get_act_scales(
         cls,
-        quant_sim: QuantizationSimModel,
+        model: torch.nn.Module,
         dataloader: DataLoader,
         num_iterations: int
     ) -> Dict:
-        device = quant_sim.model.device
+        device = model.device
         act_scales = {}
 
         def stat_tensor(name, tensor):
@@ -73,24 +73,34 @@ class Smoothquant:
             stat_tensor(name, x)
 
         hooks = []
-        for name, module in quant_sim.model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 hooks.append(
                     module.register_forward_hook(functools.partial(stat_input_hook, name=name))
                 )
         
-        ### Iteration through dataset
-        for text, _ in itertools.islice(dataloader, num_iterations):
-            _ = quant_sim.model(text.to(device))
+        for a in tqdm(
+            itertools.islice(dataloader, num_iterations), 
+            total=num_iterations, 
+            desc="Collecting activation scales"
+            ):
+            _ = model(
+                    a["input_ids"].to(device=device),
+                    a["attention_mask"].to(device=device)
+                )
 
         for h in hooks:
             h.remove()
 
         return act_scales
     
-    @torch.no_grad()
     @classmethod
-    def _smooth_lm(quant_sim, scales, alpha=0.5):
+    @torch.no_grad()
+    def _smooth_lm(
+        cls, 
+        model: torch.nn.Module, 
+        scales: Dict, 
+        alpha: int =0.5):
 
         def _smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
             if not isinstance(fcs, list):
@@ -116,7 +126,7 @@ class Smoothquant:
             for fc in fcs:
                 fc.weight.mul_(scales.view(1, -1))
 
-        for name, module in quant_sim.model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, LlamaDecoderLayer):
                 attn_ln = module.input_layernorm
                 qkv = [
